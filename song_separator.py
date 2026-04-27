@@ -17,7 +17,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 import torchaudio
-from scipy.signal import butter, sosfilt
+from scipy.signal import butter, sosfilt, sosfiltfilt
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -52,11 +52,21 @@ def _apply_highpass(waveform: np.ndarray, sample_rate: int,
     Returns:
         Filtered waveform with the same shape as the input.
     """
+    nyquist_hz = sample_rate / 2.0
+    if cutoff_hz <= 0 or cutoff_hz >= nyquist_hz:
+        # Invalid filter configuration: return original signal unchanged.
+        return waveform.astype(np.float32, copy=False)
+
     sos = _butter_highpass_sos(cutoff_hz, sample_rate)
-    filtered = np.stack(
-        [sosfilt(sos, ch) for ch in waveform],
-        axis=0,
-    )
+
+    # Prefer zero-phase filtering to avoid phase distortion (especially
+    # important for downstream pitch detection). Very short clips can fail
+    # with filtfilt due to pad length constraints, so we gracefully fall
+    # back to one-pass filtering in that case.
+    try:
+        filtered = np.stack([sosfiltfilt(sos, ch) for ch in waveform], axis=0)
+    except ValueError:
+        filtered = np.stack([sosfilt(sos, ch) for ch in waveform], axis=0)
     return filtered.astype(np.float32)
 
 
@@ -86,7 +96,10 @@ def _mix_stems(stems: Dict[str, np.ndarray]) -> np.ndarray:
     arrays = list(stems.values())
     if not arrays:
         raise ValueError("No stems provided for mixing.")
-    return np.sum(arrays, axis=0).astype(np.float32)
+    mixed = np.zeros_like(arrays[0], dtype=np.float32)
+    for arr in arrays:
+        mixed += arr.astype(np.float32, copy=False)
+    return mixed
 
 
 # ---------------------------------------------------------------------------
@@ -188,8 +201,21 @@ class SongSeparator:
         # 3. Run separation
         # ----------------------------------------------------------------
         try:
-            stems = self._run_separation(model, waveform, sample_rate,
-                                         torch_device)
+            required_stems = {"guitar"}
+            if keep_vocals:
+                required_stems.add("vocals")
+            if keep_drums:
+                required_stems.add("drums")
+            if keep_bass:
+                required_stems.add("bass")
+            if keep_piano:
+                required_stems.add("piano")
+            if keep_other:
+                required_stems.add("other")
+
+            stems = self._run_separation(
+                model, waveform, sample_rate, torch_device, required_stems
+            )
         finally:
             # ----------------------------------------------------------------
             # 4. VRAM Safety Guard – always release GPU memory after separation
@@ -197,13 +223,17 @@ class SongSeparator:
             model.cpu()
             del model
             gc.collect()
-            if device == "cuda":
+            if torch_device.type == "cuda":
                 torch.cuda.empty_cache()
 
         # ----------------------------------------------------------------
         # 5. Pre-Transcription Filter – 100 Hz HPF on guitar stem
         # ----------------------------------------------------------------
-        guitar_np = stems["guitar"]  # shape (C, T)
+        guitar_np = stems.get("guitar")
+        if guitar_np is None:
+            raise RuntimeError(
+                "SongSeparator: Demucs output does not include a 'guitar' stem."
+            )
         if keep_guitar:
             guitar_filtered = _apply_highpass(guitar_np, sample_rate,
                                               cutoff_hz=HPF_CUTOFF_HZ)
@@ -268,6 +298,7 @@ class SongSeparator:
         waveform: torch.Tensor,
         sample_rate: int,
         torch_device: torch.device,
+        required_stems: set,
     ) -> Dict[str, np.ndarray]:
         """Separate *waveform* and return a dict of {stem_name: np.ndarray}.
 
@@ -286,7 +317,7 @@ class SongSeparator:
         )
         wav = wav.unsqueeze(0).to(torch_device)  # (1, C, T)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             raw = apply_model(model, wav, device=torch_device)
         # raw shape: (batch=1, stems, channels, samples)
         raw = raw.squeeze(0).cpu()  # (stems, channels, samples)
@@ -294,7 +325,8 @@ class SongSeparator:
         stem_names: List[str] = model.sources
         result: Dict[str, np.ndarray] = {}
         for idx, name in enumerate(stem_names):
-            result[name] = raw[idx].numpy().astype(np.float32)
+            if name in required_stems:
+                result[name] = raw[idx].numpy().astype(np.float32, copy=False)
 
         return result
 
